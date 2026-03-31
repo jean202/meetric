@@ -1,15 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import type {
+  ParticipantInput,
+  PlaceCandidate,
+  Point,
+  RecommendationItem,
+  RecommendResponse,
+  TravelMode
+} from "@/lib/types";
 
-type TravelMode = "car" | "transit" | "bike" | "walk";
-
-type Point = {
-  lat: number;
-  lng: number;
-};
-
-type Participant = {
+type ParticipantDraft = {
   id: string;
   name: string;
   originLabel?: string;
@@ -24,26 +25,10 @@ type PlaceSuggestion = {
   point: Point;
 };
 
-type RouteQuote = {
-  mode: TravelMode;
-  durationSec: number;
-  distanceM: number;
-  fareKRW?: number;
-  provider: string;
-};
-
-type ParticipantRoute = {
-  participantId: string;
-  participantName: string;
-  route: RouteQuote;
-};
-
-type RecommendationItem = {
-  place: { id: string; name: string; point: Point; category?: string };
-  score: number;
-  maxDurationSec: number;
-  totalDurationSec: number;
-  details: ParticipantRoute[];
+type NearbyPlacesResponse = {
+  places?: PlaceCandidate[];
+  fallback?: boolean;
+  message?: string;
 };
 
 type Screen = "map" | "origin" | "newParticipant";
@@ -83,38 +68,28 @@ type GoogleWindow = Window & {
   __googleMapsScriptPromise?: Promise<void>;
 };
 
-const DEFAULT_CENTER: Point = { lat: 37.5740182, lng: 126.9575384 };
+const DEFAULT_MAP_CENTER: Point = { lat: 37.5665, lng: 126.978 };
+const DEFAULT_TRAVEL_MODE: TravelMode = "transit";
 
-const initialParticipants: Participant[] = [
-  { id: "p1", name: "김진하", originLabel: "독립문역", point: { lat: 37.5741, lng: 126.9578 }, mode: "transit" },
-  { id: "p2", name: "지선언니", originLabel: "광명", point: { lat: 37.4783, lng: 126.8645 }, mode: "transit" }
+const initialParticipants: ParticipantDraft[] = [
+  {
+    id: "p1",
+    name: "김진하",
+    originLabel: "독립문역",
+    point: { lat: 37.5741, lng: 126.9578 },
+    mode: DEFAULT_TRAVEL_MODE
+  },
+  {
+    id: "p2",
+    name: "지선언니",
+    originLabel: "광명",
+    point: { lat: 37.4783, lng: 126.8645 },
+    mode: DEFAULT_TRAVEL_MODE
+  }
 ];
-
-const MODE_LABELS: Record<TravelMode, string> = {
-  transit: "🚌 대중교통",
-  car: "🚗 자동차",
-  bike: "🚲 자전거",
-  walk: "🚶 도보",
-};
 
 function makeId() {
   return `p-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function centroid(points: Point[]): Point {
-  const n = points.length;
-  return {
-    lat: points.reduce((s, p) => s + p.lat, 0) / n,
-    lng: points.reduce((s, p) => s + p.lng, 0) / n,
-  };
-}
-
-function formatDuration(sec: number): string {
-  const min = Math.round(sec / 60);
-  if (min < 60) return `${min}분`;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return m > 0 ? `${h}시간 ${m}분` : `${h}시간`;
 }
 
 function loadGoogleMaps(apiKey: string): Promise<void> {
@@ -138,44 +113,156 @@ function loadGoogleMaps(apiKey: string): Promise<void> {
   return loadedWindow.__googleMapsScriptPromise;
 }
 
+function haversineDistanceMeters(a: Point, b: Point): number {
+  const radius = 6_371_000;
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const latDelta = toRad(b.lat - a.lat);
+  const lngDelta = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+
+  const distance =
+    Math.sin(latDelta / 2) * Math.sin(latDelta / 2) +
+    Math.sin(lngDelta / 2) * Math.sin(lngDelta / 2) * Math.cos(lat1) * Math.cos(lat2);
+
+  return radius * 2 * Math.atan2(Math.sqrt(distance), Math.sqrt(1 - distance));
+}
+
+function getCandidateSearchParams(participants: ParticipantInput[]) {
+  const lat = participants.reduce((sum, participant) => sum + participant.origin.lat, 0) / participants.length;
+  const lng = participants.reduce((sum, participant) => sum + participant.origin.lng, 0) / participants.length;
+  const center = { lat, lng };
+
+  const farthestDistance = participants.reduce((maxDistance, participant) => {
+    return Math.max(maxDistance, haversineDistanceMeters(center, participant.origin));
+  }, 0);
+
+  const radius = Math.round(Math.min(8_000, Math.max(1_800, farthestDistance * 1.6)));
+  return { center, radius };
+}
+
+function formatDuration(totalSeconds: number): string {
+  const minutes = Math.max(1, Math.round(totalSeconds / 60));
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+
+  if (hours === 0) {
+    return `${minutes}분`;
+  }
+
+  if (restMinutes === 0) {
+    return `${hours}시간`;
+  }
+
+  return `${hours}시간 ${restMinutes}분`;
+}
+
+function getRecommendationHint(args: {
+  recommendation?: RecommendationItem;
+  candidateCount: number;
+  candidateFallback: boolean;
+}): string {
+  const messages: string[] = [];
+
+  if (args.candidateCount > 0) {
+    messages.push(`${args.candidateCount}곳 후보 기준 추천`);
+  } else {
+    messages.push("출발지를 2곳 이상 설정하면 후보를 자동 탐색합니다.");
+  }
+
+  if (args.candidateFallback) {
+    messages.push("실시간 후보를 찾지 못해 중심점 주변 후보를 사용했습니다.");
+  } else if (
+    args.recommendation?.details.some(
+      (detail) => detail.route.isFallback || detail.route.provider === "mock"
+    )
+  ) {
+    messages.push("일부 경로는 실시간 API 대신 예상치(mock)를 사용했습니다.");
+  } else if (args.recommendation) {
+    messages.push("Google 기준으로 계산했습니다.");
+  }
+
+  return messages.join(" · ");
+}
+
 export default function RecommendDemo() {
   const [screen, setScreen] = useState<Screen>("map");
-  const [participants, setParticipants] = useState<Participant[]>(initialParticipants);
+  const [participants, setParticipants] = useState<ParticipantDraft[]>(initialParticipants);
   const [activeId, setActiveId] = useState<string>(initialParticipants[0].id);
 
   const mapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_WEB_KEY ?? "";
   const [mapError, setMapError] = useState<string | null>(null);
 
   const [originInput, setOriginInput] = useState("");
+  const [originError, setOriginError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [selectedPoint, setSelectedPoint] = useState<Point | undefined>(undefined);
 
   const [suggestions, setSuggestions] = useState<PlaceSuggestion[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
 
-  // Recommendation state
+  const [candidatePlaces, setCandidatePlaces] = useState<PlaceCandidate[]>([]);
+  const [candidateFallback, setCandidateFallback] = useState(false);
+  const [candidateLoading, setCandidateLoading] = useState(false);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
+
   const [recommendations, setRecommendations] = useState<RecommendationItem[]>([]);
-  const [selectedRec, setSelectedRec] = useState<RecommendationItem | null>(null);
-  const [isRecommending, setIsRecommending] = useState(false);
+  const [recommendLoading, setRecommendLoading] = useState(false);
   const [recommendError, setRecommendError] = useState<string | null>(null);
-  const [isDegraded, setIsDegraded] = useState(false);
+  const [selectedRecommendationId, setSelectedRecommendationId] = useState<string | null>(null);
 
   const mapRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<GoogleMap | null>(null);
+  const meetingMarkerRef = useRef<GoogleMarker | null>(null);
   const markersRef = useRef<GoogleMarker[]>([]);
 
   const activeParticipant = useMemo(
-    () => participants.find((p) => p.id === activeId) ?? participants[0],
+    () => participants.find((participant) => participant.id === activeId) ?? participants[0],
     [participants, activeId]
   );
 
-  // Meeting point: selected recommendation or default
-  const meetingPoint = selectedRec?.place.point ?? DEFAULT_CENTER;
-  const meetingLabel = selectedRec?.place.name ?? "모임 장소";
+  const recommendationParticipants = useMemo<ParticipantInput[]>(
+    () =>
+      participants.flatMap((participant) =>
+        participant.point
+          ? [
+              {
+                id: participant.id,
+                name: participant.name,
+                origin: participant.point,
+                mode: participant.mode
+              }
+            ]
+          : []
+      ),
+    [participants]
+  );
 
-  // Can recommend: at least 2 participants with valid origins
-  const readyParticipants = participants.filter((p) => p.point);
-  const canRecommend = readyParticipants.length >= 2;
+  const featuredRecommendation = useMemo(
+    () =>
+      recommendations.find((recommendation) => recommendation.place.id === selectedRecommendationId) ??
+      recommendations[0],
+    [recommendations, selectedRecommendationId]
+  );
+
+  const canSaveOrigin = Boolean(originInput.trim() && selectedPoint);
+
+  useEffect(() => {
+    if (recommendations.length === 0) {
+      if (selectedRecommendationId !== null) {
+        setSelectedRecommendationId(null);
+      }
+      return;
+    }
+
+    const hasSelectedRecommendation = recommendations.some(
+      (recommendation) => recommendation.place.id === selectedRecommendationId
+    );
+
+    if (!hasSelectedRecommendation) {
+      setSelectedRecommendationId(recommendations[0].place.id);
+    }
+  }, [recommendations, selectedRecommendationId]);
 
   useEffect(() => {
     if (screen !== "map") return;
@@ -197,27 +284,30 @@ export default function RecommendDemo() {
 
         if (!mapInstanceRef.current) {
           mapInstanceRef.current = new googleMaps.Map(mapRef.current, {
-            center: meetingPoint,
+            center: featuredRecommendation?.place.point ?? DEFAULT_MAP_CENTER,
             zoom: 11,
             disableDefaultUI: true,
             zoomControl: true
           });
         }
 
-        // Clear existing markers
+        if (meetingMarkerRef.current) {
+          meetingMarkerRef.current.setMap(null);
+          meetingMarkerRef.current = null;
+        }
+
+        if (featuredRecommendation && mapInstanceRef.current) {
+          meetingMarkerRef.current = new googleMaps.Marker({
+            map: mapInstanceRef.current,
+            position: featuredRecommendation.place.point,
+            title: featuredRecommendation.place.name,
+            label: "추천"
+          });
+        }
+
         markersRef.current.forEach((marker) => marker.setMap(null));
         markersRef.current = [];
 
-        // Meeting point marker
-        const mpMarker = new googleMaps.Marker({
-          map: mapInstanceRef.current,
-          position: meetingPoint,
-          title: meetingLabel,
-          label: selectedRec ? "★" : undefined,
-        });
-        markersRef.current.push(mpMarker);
-
-        // Participant markers
         participants.forEach((participant) => {
           if (!participant.point || !mapInstanceRef.current) return;
 
@@ -244,58 +334,191 @@ export default function RecommendDemo() {
     return () => {
       cancelled = true;
     };
-  }, [activeId, mapsApiKey, participants, screen, meetingPoint, meetingLabel, selectedRec]);
+  }, [activeId, featuredRecommendation, mapsApiKey, participants, screen]);
 
   useEffect(() => {
     if (screen !== "map") return;
     if (!mapInstanceRef.current) return;
 
-    if (selectedRec) {
-      mapInstanceRef.current.panTo(selectedRec.place.point);
-    } else if (activeParticipant?.point) {
-      mapInstanceRef.current.panTo(activeParticipant.point);
-    }
-  }, [activeParticipant, screen, selectedRec]);
+    const targetPoint = featuredRecommendation?.place.point ?? activeParticipant?.point;
+    if (!targetPoint) return;
+
+    mapInstanceRef.current.panTo(targetPoint);
+  }, [activeParticipant, featuredRecommendation, screen]);
 
   useEffect(() => {
     if (screen !== "origin") return;
-    const query = originInput.trim();
 
-    if (query.length < 2) {
+    if (selectedPoint) {
       setSuggestions([]);
+      setSearchLoading(false);
       return;
     }
 
-    const timer = setTimeout(async () => {
+    const query = originInput.trim();
+    if (query.length < 2) {
+      setSuggestions([]);
+      setSearchLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
       setSearchLoading(true);
+
       try {
-        const res = await fetch(`/api/places/search?q=${encodeURIComponent(query)}`);
-        if (!res.ok) throw new Error("장소 검색 실패");
-        const json = (await res.json()) as { places: PlaceSuggestion[] };
+        const response = await fetch(`/api/places/search?q=${encodeURIComponent(query)}`, {
+          signal: controller.signal
+        });
+        const json = (await response.json()) as {
+          message?: string;
+          places?: PlaceSuggestion[];
+        };
+
+        if (!response.ok) {
+          throw new Error(json.message ?? "장소 검색에 실패했습니다.");
+        }
+
         setSuggestions(json.places ?? []);
-      } catch {
+      } catch (error) {
+        if (controller.signal.aborted) return;
+
+        const message = error instanceof Error ? error.message : "장소 검색에 실패했습니다.";
         setSuggestions([]);
+        setOriginError(message);
       } finally {
-        setSearchLoading(false);
+        if (!controller.signal.aborted) {
+          setSearchLoading(false);
+        }
       }
     }, 250);
 
-    return () => clearTimeout(timer);
-  }, [originInput, screen]);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [originInput, screen, selectedPoint]);
+
+  useEffect(() => {
+    if (recommendationParticipants.length < 2) {
+      setCandidatePlaces([]);
+      setCandidateFallback(false);
+      setCandidateError(null);
+      setCandidateLoading(false);
+      setRecommendations([]);
+      setRecommendError(null);
+      setRecommendLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const { center, radius } = getCandidateSearchParams(recommendationParticipants);
+
+    const fetchCandidatesAndRecommendations = async () => {
+      setCandidateLoading(true);
+      setCandidateError(null);
+      setRecommendError(null);
+
+      let nextCandidates: PlaceCandidate[] = [];
+
+      try {
+        const candidateResponse = await fetch(
+          `/api/places/nearby?lat=${center.lat}&lng=${center.lng}&radius=${radius}`,
+          { signal: controller.signal }
+        );
+        const candidateJson = (await candidateResponse.json()) as NearbyPlacesResponse;
+
+        if (!candidateResponse.ok) {
+          throw new Error(candidateJson.message ?? "추천 후보를 찾지 못했습니다.");
+        }
+
+        nextCandidates = candidateJson.places ?? [];
+        if (nextCandidates.length === 0) {
+          throw new Error("추천 후보를 찾지 못했습니다.");
+        }
+
+        if (controller.signal.aborted) return;
+
+        setCandidatePlaces(nextCandidates);
+        setCandidateFallback(Boolean(candidateJson.fallback));
+      } catch (error) {
+        if (controller.signal.aborted) return;
+
+        const message = error instanceof Error ? error.message : "추천 후보를 찾지 못했습니다.";
+        setCandidatePlaces([]);
+        setCandidateFallback(false);
+        setRecommendations([]);
+        setCandidateError(message);
+        return;
+      } finally {
+        if (!controller.signal.aborted) {
+          setCandidateLoading(false);
+        }
+      }
+
+      try {
+        setRecommendLoading(true);
+
+        const response = await fetch("/api/recommend", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            participants: recommendationParticipants,
+            candidates: nextCandidates,
+            topK: 3
+          }),
+          signal: controller.signal
+        });
+
+        const json = (await response.json()) as RecommendResponse & { message?: string };
+        if (!response.ok) {
+          throw new Error(json.message ?? "추천 계산에 실패했습니다.");
+        }
+
+        if (controller.signal.aborted) return;
+
+        setRecommendations(json.recommendations ?? []);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+
+        const message = error instanceof Error ? error.message : "추천 계산에 실패했습니다.";
+        setRecommendations([]);
+        setRecommendError(message);
+      } finally {
+        if (!controller.signal.aborted) {
+          setRecommendLoading(false);
+        }
+      }
+    };
+
+    fetchCandidatesAndRecommendations();
+
+    return () => {
+      controller.abort();
+    };
+  }, [recommendationParticipants]);
 
   const openOriginScreen = (participantId: string) => {
-    const target = participants.find((p) => p.id === participantId);
+    const target = participants.find((participant) => participant.id === participantId);
     if (!target) return;
 
     setActiveId(target.id);
     setOriginInput(target.originLabel ?? "");
     setSelectedPoint(target.point);
     setSuggestions([]);
+    setOriginError(null);
     setScreen("origin");
   };
 
   const useCurrentLocation = () => {
-    if (!navigator.geolocation) return;
+    setOriginError(null);
+
+    if (!navigator.geolocation) {
+      setOriginError("이 브라우저는 현재 위치를 지원하지 않습니다.");
+      return;
+    }
 
     navigator.geolocation.getCurrentPosition(
       async (position) => {
@@ -307,43 +530,51 @@ export default function RecommendDemo() {
         setSelectedPoint(point);
 
         try {
-          const res = await fetch(`/api/places/reverse?lat=${point.lat}&lng=${point.lng}`);
-          if (!res.ok) throw new Error();
-          const json = (await res.json()) as { name: string };
+          const response = await fetch(`/api/places/reverse?lat=${point.lat}&lng=${point.lng}`);
+          const json = (await response.json()) as { message?: string; name?: string };
+
+          if (!response.ok) {
+            throw new Error(json.message ?? "현재 위치 이름을 가져오지 못했습니다.");
+          }
+
           setOriginInput(json.name || "현재 위치");
         } catch {
           setOriginInput("현재 위치");
         }
       },
       () => {
-        // Geolocation failed: don't set fake origin, show feedback
-        setOriginInput("");
-        alert("위치 권한이 거부되었습니다. 출발지를 직접 검색해주세요.");
+        setOriginError("현재 위치를 가져오지 못했습니다. 권한 설정을 확인해 주세요.");
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000
       }
     );
   };
 
   const saveOrigin = () => {
     const trimmed = originInput.trim();
-    if (!trimmed || !activeParticipant || !selectedPoint) return;
+    if (!trimmed || !activeParticipant) return;
+
+    if (!selectedPoint) {
+      setOriginError("목록에서 장소를 선택하거나 현 위치를 불러와 주세요.");
+      return;
+    }
 
     setParticipants((prev) =>
-      prev.map((p) =>
-        p.id === activeParticipant.id
+      prev.map((participant) =>
+        participant.id === activeParticipant.id
           ? {
-              ...p,
+              ...participant,
               originLabel: trimmed,
-              point: selectedPoint,
+              point: selectedPoint
             }
-          : p
+          : participant
       )
     );
 
-    // Clear recommendation when origins change
-    setRecommendations([]);
-    setSelectedRec(null);
-
     setOriginInput("");
+    setOriginError(null);
     setSelectedPoint(undefined);
     setSuggestions([]);
     setScreen("map");
@@ -353,95 +584,22 @@ export default function RecommendDemo() {
     const trimmed = newName.trim();
     if (!trimmed) return;
 
-    const next: Participant = { id: makeId(), name: trimmed, mode: "transit" };
+    const next: ParticipantDraft = {
+      id: makeId(),
+      name: trimmed,
+      mode: DEFAULT_TRAVEL_MODE
+    };
+
     setParticipants((prev) => [...prev, next]);
     setActiveId(next.id);
     setNewName("");
     setOriginInput("");
+    setOriginError(null);
     setSelectedPoint(undefined);
     setSuggestions([]);
     setScreen("origin");
   };
 
-  const handleRecommend = async () => {
-    if (!canRecommend) return;
-
-    setIsRecommending(true);
-    setRecommendError(null);
-    setIsDegraded(false);
-
-    try {
-      // 1. Calculate centroid of participants
-      const participantPoints = readyParticipants.map((p) => p.point!);
-      const center = centroid(participantPoints);
-
-      // 2. Fetch nearby candidate places
-      const nearbyRes = await fetch(
-        `/api/places/nearby?lat=${center.lat}&lng=${center.lng}&radius=3000`
-      );
-      if (!nearbyRes.ok) throw new Error("후보 장소 검색 실패");
-      const nearbyJson = await nearbyRes.json();
-      const candidates = nearbyJson.places;
-
-      if (!candidates || candidates.length === 0) {
-        throw new Error("주변에 후보 장소를 찾지 못했습니다.");
-      }
-
-      if (nearbyJson.fallback) {
-        setIsDegraded(true);
-      }
-
-      // 3. Call recommendation API
-      const participantInputs = readyParticipants.map((p) => ({
-        id: p.id,
-        name: p.name,
-        origin: p.point!,
-        mode: p.mode,
-      }));
-
-      const recRes = await fetch("/api/recommend", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          participants: participantInputs,
-          candidates,
-          topK: 5,
-        }),
-      });
-
-      if (!recRes.ok) {
-        const errJson = await recRes.json().catch(() => null);
-        throw new Error(errJson?.message ?? "추천 API 오류");
-      }
-
-      const recJson = await recRes.json();
-      const recs: RecommendationItem[] = recJson.recommendations ?? [];
-
-      if (recs.length === 0) {
-        throw new Error("추천 결과가 없습니다.");
-      }
-
-      // Check if any routes used mock provider
-      const hasMock = recs.some((r) =>
-        r.details.some((d) => d.route.provider === "mock")
-      );
-      if (hasMock) setIsDegraded(true);
-
-      setRecommendations(recs);
-      setSelectedRec(recs[0]);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "추천 중 오류가 발생했습니다.";
-      setRecommendError(msg);
-    } finally {
-      setIsRecommending(false);
-    }
-  };
-
-  const selectRecommendation = (rec: RecommendationItem) => {
-    setSelectedRec(rec);
-  };
-
-  // === Origin Screen ===
   if (screen === "origin") {
     return (
       <section className="phone">
@@ -462,9 +620,10 @@ export default function RecommendDemo() {
             <input
               className="lineInput"
               value={originInput}
-              onChange={(e) => {
-                setOriginInput(e.target.value);
+              onChange={(event) => {
+                setOriginInput(event.target.value);
                 setSelectedPoint(undefined);
+                setOriginError(null);
               }}
               placeholder="출발지를 입력해주세요"
             />
@@ -474,6 +633,11 @@ export default function RecommendDemo() {
           <button className="ghostAction" onClick={useCurrentLocation}>
             ◎ 현 위치 불러오기
           </button>
+
+          {originError ? <p className="errorText">{originError}</p> : null}
+          {!originError && originInput.trim() && !selectedPoint ? (
+            <p className="helperText">목록에서 장소를 선택하거나 현 위치를 불러와 주세요.</p>
+          ) : null}
 
           <div className="suggestionList">
             {searchLoading ? <p className="suggestionStatus">검색 중...</p> : null}
@@ -488,6 +652,7 @@ export default function RecommendDemo() {
                   setOriginInput(item.name);
                   setSelectedPoint(item.point);
                   setSuggestions([]);
+                  setOriginError(null);
                 }}
               >
                 <strong>{item.name}</strong>
@@ -498,11 +663,7 @@ export default function RecommendDemo() {
         </div>
 
         <div className="bottomCta">
-          <button
-            className="mainCta"
-            disabled={!originInput.trim() || !selectedPoint}
-            onClick={saveOrigin}
-          >
+          <button className="mainCta" disabled={!canSaveOrigin} onClick={saveOrigin}>
             참여하기
           </button>
         </div>
@@ -510,7 +671,6 @@ export default function RecommendDemo() {
     );
   }
 
-  // === New Participant Screen ===
   if (screen === "newParticipant") {
     return (
       <section className="phone">
@@ -531,7 +691,7 @@ export default function RecommendDemo() {
             <input
               className="lineInput"
               value={newName}
-              onChange={(e) => setNewName(e.target.value)}
+              onChange={(event) => setNewName(event.target.value)}
               placeholder="이름"
             />
             {newName ? (
@@ -551,7 +711,6 @@ export default function RecommendDemo() {
     );
   }
 
-  // === Map Screen ===
   return (
     <section className="phone mapScreen">
       <header className="mapHeader">
@@ -562,97 +721,97 @@ export default function RecommendDemo() {
       <div className="mapPrompt">
         <span className="mapPromptSub">어디서 만나실 건가요?</span>
         <strong>
-          {selectedRec ? selectedRec.place.name : "장소를 정해보세요"}
+          {candidateLoading
+            ? "참가자 기준으로 후보 장소를 찾는 중..."
+            : candidatePlaces.length > 0
+              ? `${candidatePlaces.length}곳 후보에서 추천합니다`
+              : "참가자 기준으로 자동 추천합니다"}
         </strong>
       </div>
 
       <div className="mapArea" ref={mapRef}>
-        {!mapsApiKey ? <p className="mapState">지도 키 로딩 중...</p> : null}
+        {!mapsApiKey ? <p className="mapState">지도 키를 설정해 주세요.</p> : null}
         {mapError ? <p className="mapState">{mapError}</p> : null}
       </div>
 
       <div className="sheet">
-        <h3>지선지나</h3>
-        <p className="dateText">2026년 2월 28일, 18:00</p>
+        <p className="sheetEyebrow">추천 장소</p>
+        <h3>
+          {candidateLoading || recommendLoading
+            ? "추천 계산 중..."
+            : featuredRecommendation?.place.name ?? "출발지를 더 설정해 주세요"}
+        </h3>
+        <p className="dateText">
+          {candidateError ??
+            recommendError ??
+            getRecommendationHint({
+              recommendation: featuredRecommendation,
+              candidateCount: candidatePlaces.length,
+              candidateFallback
+            })}
+        </p>
 
         <div className="activeBadgeWrap">
           <span className="activeBadge">
-            선택됨: {activeParticipant?.name ?? "참여자"} · {activeParticipant?.originLabel ?? "출발지 미설정"}
+            {featuredRecommendation
+              ? `최대 이동 ${formatDuration(featuredRecommendation.maxDurationSec)} · 총 이동 ${formatDuration(featuredRecommendation.totalDurationSec)}`
+              : `확정된 출발지 ${recommendationParticipants.length}명`}
           </span>
         </div>
 
         <div className="originChips">
-          {participants.map((p) => (
+          {participants.map((participant) => (
             <button
-              key={p.id}
-              className={`chip${p.id === activeId ? " active" : ""}`}
-              onClick={() => openOriginScreen(p.id)}
+              key={participant.id}
+              className={`chip${participant.id === activeId ? " active" : ""}`}
+              onClick={() => openOriginScreen(participant.id)}
             >
-              {p.originLabel ?? `${p.name} 출발지`}
+              {participant.originLabel ?? `${participant.name} 출발지`}
             </button>
           ))}
         </div>
 
-        {/* Recommendation results */}
-        {recommendations.length > 0 ? (
-          <div className="recSection">
-            {isDegraded && (
-              <p className="degradedBadge">
-                예상 데이터 기반 결과입니다 (실제 경로 API 미사용)
-              </p>
-            )}
-            <div className="recList">
-              {recommendations.map((rec, i) => (
-                <button
-                  key={rec.place.id}
-                  className={`recItem${selectedRec?.place.id === rec.place.id ? " recItemActive" : ""}`}
-                  onClick={() => selectRecommendation(rec)}
-                >
-                  <span className="recRank">{i + 1}</span>
-                  <div className="recInfo">
-                    <strong>{rec.place.name}</strong>
-                    <span className="recSummary">
-                      최대 {formatDuration(rec.maxDurationSec)}
-                    </span>
-                    <div className="recDetails">
-                      {rec.details.map((d) => (
-                        <span key={d.participantId} className="recDetail">
-                          {d.participantName} {formatDuration(d.route.durationSec)}
-                          {d.route.fareKRW ? ` · ${d.route.fareKRW.toLocaleString()}원` : ""}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                </button>
-              ))}
-            </div>
+        <div className="detailList">
+          {featuredRecommendation ? (
+            featuredRecommendation.details.map((detail) => (
+              <div key={detail.participantId} className="detailRow">
+                <span className="detailLabel">{detail.participantName}</span>
+                <span className="detailValue">{formatDuration(detail.route.durationSec)}</span>
+              </div>
+            ))
+          ) : (
+            <p className="detailEmpty">출발지를 2곳 이상 확정하면 추천 결과를 보여줍니다.</p>
+          )}
+        </div>
+
+        {recommendations.length > 1 ? (
+          <div className="recommendationList">
+            {recommendations.map((item, index) => (
+              <button
+                key={item.place.id}
+                type="button"
+                className={`recommendationItem${
+                  item.place.id === featuredRecommendation?.place.id ? " active" : ""
+                }`}
+                onClick={() => setSelectedRecommendationId(item.place.id)}
+              >
+                <span className="recommendationRank">{index + 1}</span>
+                <div className="recommendationInfo">
+                  <strong>{item.place.name}</strong>
+                  <span>
+                    최대 {formatDuration(item.maxDurationSec)} · 총 {formatDuration(item.totalDurationSec)}
+                  </span>
+                </div>
+              </button>
+            ))}
           </div>
-        ) : (
-          <div className="duration">
-            {isRecommending
-              ? "추천 중..."
-              : recommendError
-                ? recommendError
-                : canRecommend
-                  ? "아래 버튼으로 만남 장소를 추천받으세요"
-                  : "출발지를 2명 이상 설정해주세요"}
-          </div>
-        )}
+        ) : null}
 
         <div className="sheetActions">
           <button className="addBtn" onClick={() => setScreen("newParticipant")}>
-            👤+ 출발지 추가하기
+            출발지 추가하기
           </button>
-          {canRecommend && (
-            <button
-              className="recBtn"
-              onClick={handleRecommend}
-              disabled={isRecommending}
-            >
-              {isRecommending ? "..." : "추천"}
-            </button>
-          )}
-          <button className="shareBtn" aria-label="공유">
+          <button className="shareBtn" aria-label="공유" disabled>
             ⤴
           </button>
         </div>

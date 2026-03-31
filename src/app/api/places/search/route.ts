@@ -88,6 +88,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ places: [] });
   }
 
+  if (query.length > 80) {
+    return NextResponse.json({ message: "검색어는 80자 이하로 입력해 주세요." }, { status: 400 });
+  }
+
   if (!apiKey) {
     return NextResponse.json(
       { message: "GOOGLE_MAPS_SERVER_API_KEY가 없습니다." },
@@ -103,6 +107,13 @@ export async function GET(req: NextRequest) {
       `&key=${encodeURIComponent(apiKey)}`;
 
     const placeRes = await fetch(placeUrl, { cache: "no-store" });
+    if (!placeRes.ok) {
+      return NextResponse.json(
+        { message: `Google Places API 호출이 실패했습니다. (${placeRes.status})` },
+        { status: 502 }
+      );
+    }
+
     const placeJson = toGoogleResponse(await placeRes.json());
 
     if (
@@ -129,6 +140,13 @@ export async function GET(req: NextRequest) {
       `&key=${encodeURIComponent(apiKey)}`;
 
     const geoRes = await fetch(geocodeUrl, { cache: "no-store" });
+    if (!geoRes.ok) {
+      return NextResponse.json(
+        { message: `Google Geocoding API 호출이 실패했습니다. (${geoRes.status})` },
+        { status: 502 }
+      );
+    }
+
     const geoJson = toGoogleResponse(await geoRes.json());
 
     if (geoJson.status && geoJson.status !== "OK" && geoJson.status !== "ZERO_RESULTS") {

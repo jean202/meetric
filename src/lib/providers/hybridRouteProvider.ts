@@ -1,4 +1,4 @@
-import { Point, RouteQuote, TravelMode } from "@/lib/types";
+import { Point, RouteFallbackReason, RouteQuote, TravelMode } from "@/lib/types";
 import { RouteProvider } from "@/lib/providers/base";
 import { MockRouteProvider } from "@/lib/providers/mockRouteProvider";
 
@@ -71,9 +71,23 @@ export class HybridRouteProvider implements RouteProvider {
   private readonly fallback = new MockRouteProvider();
   private readonly apiKey = process.env.GOOGLE_ROUTES_API_KEY ?? "";
 
+  private async quoteFallback(
+    origin: Point,
+    destination: Point,
+    mode: TravelMode,
+    reason: RouteFallbackReason
+  ): Promise<RouteQuote> {
+    const fallbackRoute = await this.fallback.quote(origin, destination, mode);
+    return {
+      ...fallbackRoute,
+      isFallback: true,
+      fallbackReason: reason
+    };
+  }
+
   async quote(origin: Point, destination: Point, mode: TravelMode): Promise<RouteQuote> {
     if (!this.apiKey) {
-      return this.fallback.quote(origin, destination, mode);
+      return this.quoteFallback(origin, destination, mode, "missing_api_key");
     }
 
     try {
@@ -107,7 +121,7 @@ export class HybridRouteProvider implements RouteProvider {
         provider: "google"
       };
     } catch {
-      return this.fallback.quote(origin, destination, mode);
+      return this.quoteFallback(origin, destination, mode, "provider_error");
     }
   }
 }

@@ -1,4 +1,5 @@
 export type TravelMode = "car" | "transit" | "bike" | "walk";
+export type RouteFallbackReason = "missing_api_key" | "provider_error";
 
 export interface Point {
   lat: number;
@@ -25,6 +26,8 @@ export interface RouteQuote {
   distanceM: number;
   fareKRW?: number;
   provider: "tmap" | "kakaomobility" | "google" | "mock";
+  isFallback?: boolean;
+  fallbackReason?: RouteFallbackReason;
 }
 
 export interface ParticipantRoute {

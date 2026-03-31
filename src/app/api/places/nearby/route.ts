@@ -1,11 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-
-type PlaceCandidate = {
-  id: string;
-  name: string;
-  point: { lat: number; lng: number };
-  category?: string;
-};
+import { PlaceCandidate } from "@/lib/types";
 
 type GoogleApiLocation = {
   lat?: number;
@@ -28,6 +22,14 @@ type GoogleNearbyResponse = {
   results?: GoogleNearbyResult[];
 };
 
+function toGoogleResponse(value: unknown): GoogleNearbyResponse {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  return value as GoogleNearbyResponse;
+}
+
 function toCandidate(raw: GoogleNearbyResult): PlaceCandidate | null {
   const lat = raw.geometry?.location?.lat;
   const lng = raw.geometry?.location?.lng;
@@ -37,21 +39,26 @@ function toCandidate(raw: GoogleNearbyResult): PlaceCandidate | null {
     id: raw.place_id ?? `${lat}-${lng}`,
     name: raw.name ?? raw.vicinity ?? "알 수 없는 장소",
     point: { lat: lat!, lng: lng! },
-    category: raw.types?.[0],
+    category: raw.types?.[0]
   };
 }
 
-/**
- * Generates grid-based fallback candidates around a center point.
- * Used when Google Places API is unavailable.
- */
-function generateGridCandidates(
-  lat: number,
-  lng: number,
-  radiusM: number
-): PlaceCandidate[] {
+function getGoogleErrorMessage(status?: string, errorMessage?: string): string {
+  if (status === "REQUEST_DENIED") {
+    return `Google API 요청이 거부되었습니다. 키 제한(Referrer/IP) 및 API 활성화 상태를 확인하세요.${
+      errorMessage ? ` (${errorMessage})` : ""
+    }`;
+  }
+
+  if (status === "OVER_QUERY_LIMIT") {
+    return "Google API 할당량을 초과했습니다. 프로젝트 quota를 확인하세요.";
+  }
+
+  return `Google API 응답 상태가 비정상입니다: ${status ?? "UNKNOWN"}`;
+}
+
+function generateGridCandidates(lat: number, lng: number, radiusM: number): PlaceCandidate[] {
   const candidates: PlaceCandidate[] = [];
-  // ~111km per degree latitude
   const latOffset = radiusM / 111_000;
   const lngOffset = radiusM / (111_000 * Math.cos((lat * Math.PI) / 180));
 
@@ -65,16 +72,15 @@ function generateGridCandidates(
       candidates.push({
         id: `grid-${idx++}`,
         name: `후보 ${idx}`,
-        point: { lat: Number(cLat.toFixed(6)), lng: Number(cLng.toFixed(6)) },
+        point: { lat: Number(cLat.toFixed(6)), lng: Number(cLng.toFixed(6)) }
       });
     }
   }
 
-  // Also include center itself
   candidates.push({
     id: "grid-center",
     name: "중간 지점",
-    point: { lat: Number(lat.toFixed(6)), lng: Number(lng.toFixed(6)) },
+    point: { lat: Number(lat.toFixed(6)), lng: Number(lng.toFixed(6)) }
   });
 
   return candidates;
@@ -83,7 +89,8 @@ function generateGridCandidates(
 export async function GET(req: NextRequest) {
   const lat = Number(req.nextUrl.searchParams.get("lat"));
   const lng = Number(req.nextUrl.searchParams.get("lng"));
-  const radius = Number(req.nextUrl.searchParams.get("radius")) || 3000;
+  const requestedRadius = Number(req.nextUrl.searchParams.get("radius")) || 3000;
+  const radius = Math.min(8000, Math.max(1200, Math.round(requestedRadius)));
   const apiKey =
     process.env.GOOGLE_MAPS_SERVER_API_KEY ?? process.env.GOOGLE_MAPS_API_KEY;
 
@@ -95,15 +102,13 @@ export async function GET(req: NextRequest) {
   }
 
   if (!apiKey) {
-    // No API key: return grid-based fallback candidates
     return NextResponse.json({
       places: generateGridCandidates(lat, lng, radius),
-      fallback: true,
+      fallback: true
     });
   }
 
   try {
-    // Search for subway stations (primary meeting points in Seoul)
     const stationUrl =
       "https://maps.googleapis.com/maps/api/place/nearbysearch/json" +
       `?location=${lat},${lng}` +
@@ -112,8 +117,7 @@ export async function GET(req: NextRequest) {
       "&language=ko" +
       `&key=${encodeURIComponent(apiKey)}`;
 
-    // Search for popular places (cafes, restaurants)
-    const placeUrl =
+    const cafeUrl =
       "https://maps.googleapis.com/maps/api/place/nearbysearch/json" +
       `?location=${lat},${lng}` +
       `&radius=${Math.round(radius * 0.7)}` +
@@ -121,46 +125,62 @@ export async function GET(req: NextRequest) {
       "&language=ko" +
       `&key=${encodeURIComponent(apiKey)}`;
 
-    const [stationRes, placeRes] = await Promise.all([
+    const [stationRes, cafeRes] = await Promise.all([
       fetch(stationUrl, { cache: "no-store" }),
-      fetch(placeUrl, { cache: "no-store" }),
+      fetch(cafeUrl, { cache: "no-store" })
     ]);
 
-    const stationJson = (await stationRes.json()) as GoogleNearbyResponse;
-    const placeJson = (await placeRes.json()) as GoogleNearbyResponse;
+    if (!stationRes.ok || !cafeRes.ok) {
+      throw new Error(
+        `Google Nearby Search 호출이 실패했습니다. (${stationRes.status}/${cafeRes.status})`
+      );
+    }
+
+    const stationJson = toGoogleResponse(await stationRes.json());
+    const cafeJson = toGoogleResponse(await cafeRes.json());
+
+    const responses = [stationJson, cafeJson];
+    for (const response of responses) {
+      if (response.status && response.status !== "OK" && response.status !== "ZERO_RESULTS") {
+        throw new Error(getGoogleErrorMessage(response.status, response.error_message));
+      }
+    }
 
     const stations = (stationJson.results ?? [])
       .map(toCandidate)
-      .filter((c): c is PlaceCandidate => c !== null)
+      .filter((candidate): candidate is PlaceCandidate => candidate !== null)
       .slice(0, 5);
 
-    const cafes = (placeJson.results ?? [])
+    const cafes = (cafeJson.results ?? [])
       .map(toCandidate)
-      .filter((c): c is PlaceCandidate => c !== null)
+      .filter((candidate): candidate is PlaceCandidate => candidate !== null)
       .slice(0, 3);
 
-    // Deduplicate by id
     const seen = new Set<string>();
     const merged: PlaceCandidate[] = [];
-    for (const c of [...stations, ...cafes]) {
-      if (!seen.has(c.id)) {
-        seen.add(c.id);
-        merged.push(c);
+    for (const candidate of [...stations, ...cafes]) {
+      if (!seen.has(candidate.id)) {
+        seen.add(candidate.id);
+        merged.push(candidate);
       }
     }
 
     if (merged.length === 0) {
       return NextResponse.json({
         places: generateGridCandidates(lat, lng, radius),
-        fallback: true,
+        fallback: true
       });
     }
 
     return NextResponse.json({ places: merged, fallback: false });
-  } catch {
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "근처 장소 후보를 가져오지 못했습니다.";
+
     return NextResponse.json({
       places: generateGridCandidates(lat, lng, radius),
       fallback: true,
+      message
     });
   }
 }
