@@ -11,6 +11,7 @@ import type {
 import type { ParticipantDraft, Screen } from "./recommend/types";
 import { DEFAULT_MAP_CENTER, DEFAULT_TRAVEL_MODE } from "./recommend/types";
 import { getCandidateSearchParams, makeId } from "./recommend/utils";
+import { loadParticipants, saveParticipants } from "@/lib/storage";
 import OriginScreen from "./recommend/OriginScreen";
 import NewParticipantScreen from "./recommend/NewParticipantScreen";
 import RecommendPanel from "./recommend/RecommendPanel";
@@ -76,8 +77,14 @@ const initialParticipants: ParticipantDraft[] = [
 
 export default function RecommendDemo() {
   const [screen, setScreen] = useState<Screen>("map");
-  const [participants, setParticipants] = useState<ParticipantDraft[]>(initialParticipants);
-  const [activeId, setActiveId] = useState<string>(initialParticipants[0].id);
+  const [participants, setParticipants] = useState<ParticipantDraft[]>(() => {
+    const saved = loadParticipants();
+    return saved && saved.length > 0 ? saved : initialParticipants;
+  });
+  const [activeId, setActiveId] = useState<string>(() => {
+    const saved = loadParticipants();
+    return saved && saved.length > 0 ? saved[0].id : initialParticipants[0].id;
+  });
 
   const mapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_WEB_KEY ?? "";
   const [mapError, setMapError] = useState<string | null>(null);
@@ -115,6 +122,11 @@ export default function RecommendDemo() {
       recommendations.find((r) => r.place.id === selectedRecommendationId) ?? recommendations[0],
     [recommendations, selectedRecommendationId]
   );
+
+  // Persist participants to localStorage
+  useEffect(() => {
+    saveParticipants(participants);
+  }, [participants]);
 
   // Sync selectedRecommendationId with recommendations
   useEffect(() => {
